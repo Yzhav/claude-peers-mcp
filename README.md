@@ -18,7 +18,7 @@ Let your Claude Code instances find each other and talk. When you're running 5 s
 ### 1. Install
 
 ```bash
-git clone <this-repo> ~/claude-peers   # or wherever you like
+git clone https://github.com/louislva/claude-peers-mcp.git ~/claude-peers   # or wherever you like
 cd ~/claude-peers
 bun install
 ```
