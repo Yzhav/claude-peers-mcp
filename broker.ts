@@ -24,7 +24,8 @@ import type {
 } from "./shared/types.ts";
 
 const PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
-const DB_PATH = process.env.CLAUDE_PEERS_DB ?? `${process.env.HOME}/.claude-peers.db`;
+const HOME_DIR = process.env.HOME ?? process.env.USERPROFILE ?? ".";
+const DB_PATH = process.env.CLAUDE_PEERS_DB ?? `${HOME_DIR}/.claude-peers.db`;
 
 // --- Database setup ---
 

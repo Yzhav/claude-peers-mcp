@@ -134,14 +134,31 @@ switch (cmd) {
       const health = await brokerFetch<{ status: string; peers: number }>("/health");
       console.log(`Broker has ${health.peers} peer(s). Shutting down...`);
       // Find and kill the broker process on the port
-      const proc = Bun.spawnSync(["lsof", "-ti", `:${BROKER_PORT}`]);
-      const pids = new TextDecoder()
-        .decode(proc.stdout)
-        .trim()
-        .split("\n")
-        .filter((p) => p);
+      let pids: string[] = [];
+      if (process.platform === "win32") {
+        const proc = Bun.spawnSync(["cmd", "/c", `for /f "tokens=5" %a in ('netstat -ano ^| findstr :${BROKER_PORT} ^| findstr LISTENING') do @echo %a`]);
+        pids = new TextDecoder()
+          .decode(proc.stdout)
+          .trim()
+          .split("\n")
+          .filter((p) => p && p !== "0");
+      } else {
+        const proc = Bun.spawnSync(["lsof", "-ti", `:${BROKER_PORT}`]);
+        pids = new TextDecoder()
+          .decode(proc.stdout)
+          .trim()
+          .split("\n")
+          .filter((p) => p);
+      }
       for (const pid of pids) {
-        process.kill(parseInt(pid), "SIGTERM");
+        try {
+          process.kill(parseInt(pid), "SIGTERM");
+        } catch {
+          // On Windows, SIGTERM may not work; try forceful kill
+          if (process.platform === "win32") {
+            Bun.spawnSync(["taskkill", "/F", "/PID", pid]);
+          }
+        }
       }
       console.log("Broker stopped.");
     } catch {

@@ -38,7 +38,9 @@ const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
-const BROKER_SCRIPT = new URL("./broker.ts", import.meta.url).pathname;
+// On Windows, URL.pathname produces "/G:/path" — remove the leading slash
+const _brokerUrl = new URL("./broker.ts", import.meta.url).pathname;
+const BROKER_SCRIPT = process.platform === "win32" ? _brokerUrl.replace(/^\//, "") : _brokerUrl;
 
 // --- Broker communication ---
 
@@ -117,6 +119,10 @@ async function getGitRoot(cwd: string): Promise<string | null> {
 }
 
 function getTty(): string | null {
+  if (process.platform === "win32") {
+    // Windows doesn't have TTY in the Unix sense; use PID as identifier
+    return `win-pid-${process.ppid ?? process.pid}`;
+  }
   try {
     // Try to get the parent's tty from the process tree
     const ppid = process.ppid;
