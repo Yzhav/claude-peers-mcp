@@ -4,6 +4,7 @@ export type PeerId = string;
 export interface Peer {
   id: PeerId;
   pid: number;
+  ppid: number;
   cwd: string;
   git_root: string | null;
   tty: string | null;
@@ -25,6 +26,7 @@ export interface Message {
 
 export interface RegisterRequest {
   pid: number;
+  ppid: number;
   cwd: string;
   git_root: string | null;
   tty: string | null;

@@ -37,6 +37,7 @@ db.run(`
   CREATE TABLE IF NOT EXISTS peers (
     id TEXT PRIMARY KEY,
     pid INTEGER NOT NULL,
+    ppid INTEGER NOT NULL DEFAULT 0,
     cwd TEXT NOT NULL,
     git_root TEXT,
     tty TEXT,
@@ -45,6 +46,13 @@ db.run(`
     last_seen TEXT NOT NULL
   )
 `);
+
+// Migrate existing databases: add ppid column if missing
+try {
+  db.run("ALTER TABLE peers ADD COLUMN ppid INTEGER NOT NULL DEFAULT 0");
+} catch {
+  // Column already exists — ignore
+}
 
 db.run(`
   CREATE TABLE IF NOT EXISTS messages (
@@ -59,15 +67,45 @@ db.run(`
   )
 `);
 
-// Clean up stale peers (PIDs that no longer exist) on startup
-function cleanStalePeers() {
-  const peers = db.query("SELECT id, pid FROM peers").all() as { id: string; pid: number }[];
-  for (const peer of peers) {
+// Cross-platform process existence check
+function isProcessAlive(pid: number): boolean {
+  if (process.platform === "win32") {
     try {
-      // Check if process is still alive (signal 0 doesn't kill, just checks)
-      process.kill(peer.pid, 0);
+      const proc = Bun.spawnSync(["tasklist", "/FI", `PID eq ${pid}`, "/NH", "/FO", "CSV"]);
+      const output = new TextDecoder().decode(proc.stdout);
+      return output.includes(`"${pid}"`);
     } catch {
-      // Process doesn't exist, remove it
+      return false;
+    }
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Stale timeout: if no heartbeat for 60s (4x heartbeat interval), consider dead
+const STALE_TIMEOUT_MS = 60_000;
+
+// Clean up stale peers: dead PIDs, orphaned processes, or heartbeat timeout
+function cleanStalePeers() {
+  const peers = db.query("SELECT id, pid, ppid, last_seen FROM peers").all() as {
+    id: string;
+    pid: number;
+    ppid: number;
+    last_seen: string;
+  }[];
+  const now = Date.now();
+
+  for (const peer of peers) {
+    const lastSeenAge = now - new Date(peer.last_seen).getTime();
+    const pidAlive = isProcessAlive(peer.pid);
+    // ppid=0 means legacy registration (no ppid tracked) — skip ppid check
+    const ppidAlive = peer.ppid === 0 || isProcessAlive(peer.ppid);
+
+    if (!pidAlive || !ppidAlive || lastSeenAge > STALE_TIMEOUT_MS) {
       db.run("DELETE FROM peers WHERE id = ?", [peer.id]);
       db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [peer.id]);
     }
@@ -82,8 +120,8 @@ setInterval(cleanStalePeers, 30_000);
 // --- Prepared statements ---
 
 const insertPeer = db.prepare(`
-  INSERT INTO peers (id, pid, cwd, git_root, tty, summary, registered_at, last_seen)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO peers (id, pid, ppid, cwd, git_root, tty, summary, registered_at, last_seen)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const updateLastSeen = db.prepare(`
@@ -146,7 +184,7 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
     deletePeer.run(existing.id);
   }
 
-  insertPeer.run(id, body.pid, body.cwd, body.git_root, body.tty, body.summary, now, now);
+  insertPeer.run(id, body.pid, body.ppid ?? 0, body.cwd, body.git_root, body.tty, body.summary, now, now);
   return { id };
 }
 
@@ -185,16 +223,16 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
     peers = peers.filter((p) => p.id !== body.exclude_id);
   }
 
-  // Verify each peer's process is still alive
+  // Verify each peer's process is still alive (pid + ppid check)
   return peers.filter((p) => {
-    try {
-      process.kill(p.pid, 0);
+    const pidAlive = isProcessAlive(p.pid);
+    const ppidAlive = p.ppid === 0 || isProcessAlive(p.ppid);
+    if (pidAlive && ppidAlive) {
       return true;
-    } catch {
-      // Clean up dead peer
-      deletePeer.run(p.id);
-      return false;
     }
+    // Clean up dead/orphaned peer
+    deletePeer.run(p.id);
+    return false;
   });
 }
 

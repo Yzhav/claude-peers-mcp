@@ -31,6 +31,7 @@ import {
   getGitBranch,
   getRecentFiles,
 } from "./shared/summarize.ts";
+import { fileURLToPath } from "node:url";
 
 // --- Configuration ---
 
@@ -38,9 +39,8 @@ const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
-// On Windows, URL.pathname produces "/G:/path" — remove the leading slash
-const _brokerUrl = new URL("./broker.ts", import.meta.url).pathname;
-const BROKER_SCRIPT = process.platform === "win32" ? _brokerUrl.replace(/^\//, "") : _brokerUrl;
+// Use fileURLToPath for correct cross-platform path resolution
+const BROKER_SCRIPT = fileURLToPath(new URL("./broker.ts", import.meta.url));
 
 // --- Broker communication ---
 
@@ -144,6 +144,18 @@ function getTty(): string | null {
 let myId: PeerId | null = null;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
+
+// Local buffer for messages received by poll loop.
+// Channel notifications may silently fail when loaded as regular MCP (not development channel),
+// so we buffer messages locally and serve them via check_messages.
+interface BufferedMessage {
+  from_id: string;
+  text: string;
+  sent_at: string;
+  from_summary: string;
+  from_cwd: string;
+}
+const receivedMessages: BufferedMessage[] = [];
 
 // --- MCP Server ---
 
@@ -369,35 +381,41 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           isError: true,
         };
       }
+
+      // Also poll broker for any new messages not yet picked up by the background loop
       try {
         const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
-        if (result.messages.length === 0) {
-          return {
-            content: [{ type: "text" as const, text: "No new messages." }],
-          };
+        for (const msg of result.messages) {
+          receivedMessages.push({
+            from_id: msg.from_id,
+            text: msg.text,
+            sent_at: msg.sent_at,
+            from_summary: "",
+            from_cwd: "",
+          });
         }
-        const lines = result.messages.map(
-          (m) => `From ${m.from_id} (${m.sent_at}):\n${m.text}`
-        );
+      } catch {
+        // Broker might be down, still return buffered messages
+      }
+
+      // Drain local buffer
+      const messages = receivedMessages.splice(0);
+      if (messages.length === 0) {
         return {
-          content: [
-            {
-              type: "text" as const,
-              text: `${result.messages.length} new message(s):\n\n${lines.join("\n\n---\n\n")}`,
-            },
-          ],
-        };
-      } catch (e) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Error checking messages: ${e instanceof Error ? e.message : String(e)}`,
-            },
-          ],
-          isError: true,
+          content: [{ type: "text" as const, text: "No new messages." }],
         };
       }
+      const lines = messages.map(
+        (m) => `From ${m.from_id} (${m.sent_at}):\n${m.text}`
+      );
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `${messages.length} new message(s):\n\n${lines.join("\n\n---\n\n")}`,
+          },
+        ],
+      };
     }
 
     default:
@@ -432,21 +450,35 @@ async function pollAndPushMessages() {
         // Non-critical, proceed without sender info
       }
 
-      // Push as channel notification — this is what makes it immediate
-      await mcp.notification({
-        method: "notifications/claude/channel",
-        params: {
-          content: msg.text,
-          meta: {
-            from_id: msg.from_id,
-            from_summary: fromSummary,
-            from_cwd: fromCwd,
-            sent_at: msg.sent_at,
-          },
-        },
+      // Buffer locally so check_messages can retrieve even if channel notification fails
+      receivedMessages.push({
+        from_id: msg.from_id,
+        text: msg.text,
+        sent_at: msg.sent_at,
+        from_summary: fromSummary,
+        from_cwd: fromCwd,
       });
 
-      log(`Pushed message from ${msg.from_id}: ${msg.text.slice(0, 80)}`);
+      // Push as channel notification — this is what makes it immediate
+      // May silently fail when loaded as regular MCP (not development channel)
+      try {
+        await mcp.notification({
+          method: "notifications/claude/channel",
+          params: {
+            content: msg.text,
+            meta: {
+              from_id: msg.from_id,
+              from_summary: fromSummary,
+              from_cwd: fromCwd,
+              sent_at: msg.sent_at,
+            },
+          },
+        });
+      } catch {
+        // Channel notification not supported in this mode — messages are still buffered
+      }
+
+      log(`Received message from ${msg.from_id}: ${msg.text.slice(0, 80)}`);
     }
   } catch (e) {
     // Broker might be down temporarily, don't crash
@@ -496,6 +528,7 @@ async function main() {
   // 4. Register with broker
   const reg = await brokerFetch<RegisterResponse>("/register", {
     pid: process.pid,
+    ppid: process.ppid ?? 0,
     cwd: myCwd,
     git_root: myGitRoot,
     tty,
@@ -553,6 +586,9 @@ async function main() {
 
   process.on("SIGINT", cleanup);
   process.on("SIGTERM", cleanup);
+  // On Windows, SIGINT/SIGTERM may not fire reliably.
+  // Use 'beforeExit' as an additional safety net for cleanup.
+  process.on("beforeExit", cleanup);
 }
 
 main().catch((e) => {
