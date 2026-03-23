@@ -139,6 +139,30 @@ function getTty(): string | null {
   return null;
 }
 
+// --- Parent process watchdog (Windows orphan prevention) ---
+
+const WATCHDOG_INTERVAL_MS = 5_000;
+const parentPid = process.ppid;
+
+function isParentAlive(): boolean {
+  if (!parentPid || parentPid === 0) return true; // Can't check, assume alive
+  if (process.platform === "win32") {
+    try {
+      const proc = Bun.spawnSync(["tasklist", "/FI", `PID eq ${parentPid}`, "/NH", "/FO", "CSV"]);
+      const output = new TextDecoder().decode(proc.stdout);
+      return output.includes(`"${parentPid}"`);
+    } catch {
+      return true; // Can't check, assume alive
+    }
+  }
+  try {
+    process.kill(parentPid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // --- State ---
 
 let myId: PeerId | null = null;
@@ -570,9 +594,13 @@ async function main() {
   }, HEARTBEAT_INTERVAL_MS);
 
   // 8. Clean up on exit
+  let cleanupCalled = false;
   const cleanup = async () => {
+    if (cleanupCalled) return; // Prevent double cleanup
+    cleanupCalled = true;
     clearInterval(pollTimer);
     clearInterval(heartbeatTimer);
+    clearInterval(watchdogTimer);
     if (myId) {
       try {
         await brokerFetch("/unregister", { id: myId });
@@ -583,6 +611,14 @@ async function main() {
     }
     process.exit(0);
   };
+
+  // 9. Parent process watchdog — detect orphaned MCP server on Windows
+  const watchdogTimer = setInterval(() => {
+    if (!isParentAlive()) {
+      log(`Parent process (PID ${parentPid}) died — cleaning up and exiting`);
+      cleanup();
+    }
+  }, WATCHDOG_INTERVAL_MS);
 
   process.on("SIGINT", cleanup);
   process.on("SIGTERM", cleanup);

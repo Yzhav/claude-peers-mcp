@@ -86,8 +86,15 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
-// Stale timeout: if no heartbeat for 60s (4x heartbeat interval), consider dead
-const STALE_TIMEOUT_MS = 60_000;
+// Stale timeout: if no heartbeat for 30s (2x heartbeat interval), consider dead
+const STALE_TIMEOUT_MS = 30_000;
+
+// Auto-shutdown: if no peers for this long, broker exits itself
+const IDLE_SHUTDOWN_MS = 5 * 60_000; // 5 minutes
+let lastPeerSeenAt = Date.now();
+
+// Old message cleanup threshold
+const MESSAGE_RETENTION_MS = 60 * 60_000; // 1 hour
 
 // Clean up stale peers: dead PIDs, orphaned processes, or heartbeat timeout
 function cleanStalePeers() {
@@ -110,12 +117,26 @@ function cleanStalePeers() {
       db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [peer.id]);
     }
   }
+
+  // Clean up old delivered messages (prevent DB bloat)
+  const cutoff = new Date(now - MESSAGE_RETENTION_MS).toISOString();
+  db.run("DELETE FROM messages WHERE delivered = 1 AND sent_at < ?", [cutoff]);
+
+  // Track idle state for auto-shutdown
+  const remainingPeers = (selectAllPeers.all() as Peer[]).length;
+  if (remainingPeers > 0) {
+    lastPeerSeenAt = now;
+  } else if (now - lastPeerSeenAt > IDLE_SHUTDOWN_MS) {
+    console.error("[claude-peers broker] No peers for 5 minutes — shutting down");
+    db.close();
+    process.exit(0);
+  }
 }
 
 cleanStalePeers();
 
-// Periodically clean stale peers (every 30s)
-setInterval(cleanStalePeers, 30_000);
+// Periodically clean stale peers (every 15s for faster orphan detection)
+setInterval(cleanStalePeers, 15_000);
 
 // --- Prepared statements ---
 
@@ -177,14 +198,23 @@ function generateId(): string {
 function handleRegister(body: RegisterRequest): RegisterResponse {
   const id = generateId();
   const now = new Date().toISOString();
+  const ppid = body.ppid ?? 0;
 
   // Remove any existing registration for this PID (re-registration)
-  const existing = db.query("SELECT id FROM peers WHERE pid = ?").get(body.pid) as { id: string } | null;
-  if (existing) {
-    deletePeer.run(existing.id);
+  const existingByPid = db.query("SELECT id FROM peers WHERE pid = ?").get(body.pid) as { id: string } | null;
+  if (existingByPid) {
+    deletePeer.run(existingByPid.id);
   }
 
-  insertPeer.run(id, body.pid, body.ppid ?? 0, body.cwd, body.git_root, body.tty, body.summary, now, now);
+  // Remove any existing registration for this PPID (same Claude Code session, duplicate MCP)
+  if (ppid !== 0) {
+    const existingByPpid = db.query("SELECT id FROM peers WHERE ppid = ?").get(ppid) as { id: string } | null;
+    if (existingByPpid) {
+      deletePeer.run(existingByPpid.id);
+    }
+  }
+
+  insertPeer.run(id, body.pid, ppid, body.cwd, body.git_root, body.tty, body.summary, now, now);
   return { id };
 }
 
