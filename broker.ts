@@ -123,7 +123,7 @@ function cleanStalePeers() {
   db.run("DELETE FROM messages WHERE delivered = 1 AND sent_at < ?", [cutoff]);
 
   // Track idle state for auto-shutdown
-  const remainingPeers = (selectAllPeers.all() as Peer[]).length;
+  const remainingPeers = (db.query("SELECT COUNT(*) as cnt FROM peers").get() as { cnt: number }).cnt;
   if (remainingPeers > 0) {
     lastPeerSeenAt = now;
   } else if (now - lastPeerSeenAt > IDLE_SHUTDOWN_MS) {
